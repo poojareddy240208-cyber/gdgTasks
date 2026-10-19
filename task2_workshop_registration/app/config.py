@@ -13,7 +13,7 @@ Usage
     print(settings.database_url)               # postgresql+asyncpg://...
 """
 
-from pydantic import Field, AnyUrl, field_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 

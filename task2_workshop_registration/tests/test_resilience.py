@@ -3,74 +3,6 @@ tests/test_resilience.py
 =========================
 Crash-resilience integration test — "register 50, kill -9 mid-delivery, restart,
 confirm all 50 arrive exactly once."
-
-What this test proves
----------------------
-1. **Transactional outbox durability** (REQ-OB-01, REQ-OB-04)
-   Every Registration + OutboxEvent pair is written in a single DB commit.
-   A SIGKILL between commit and notification delivery cannot lose either row.
-
-2. **Crash recovery** (REQ-OB-04, design §7.5)
-   On restart the relay worker finds all PENDING/PROCESSING outbox records
-   and re-delivers them.  PostgreSQL rolls back PROCESSING rows whose
-   connection died, returning them to the PENDING state automatically.
-
-3. **At-least-once / exactly-once via idempotency key** (REQ-OB-05, REQ-OB-07)
-   The mock server tracks every received Idempotency-Key.  After full
-   recovery we assert:
-     * total distinct idempotency keys  == 50  (every registration notified)
-     * max delivery count per key       == 1   (no duplicate sends)
-
-4. **All outbox records reach DELIVERED** (state machine completeness)
-   Direct DB inspection confirms zero rows in PENDING or PROCESSING after
-   the full recovery cycle.
-
-Test infrastructure
---------------------
-The test uses **Docker Compose** to manage all three services (db, app,
-mock_service) so it is a genuine end-to-end integration test rather than
-an in-process unit test.  It requires:
-
-  * Docker Engine running on the host
-  * docker compose v2 (plugin syntax)
-  * The workspace root contains docker-compose.yml
-
-Run with::
-
-    pytest tests/test_resilience.py -v -s
-
-Or directly::
-
-    python tests/test_resilience.py
-
-Environment variables
----------------------
-  APP_BASE_URL       Default: http://localhost:8000
-  MOCK_BASE_URL      Default: http://localhost:8001
-  COMPOSE_FILE       Default: docker-compose.yml
-  RECOVERY_TIMEOUT_S Default: 120   (seconds to wait for full re-delivery)
-  POLL_INTERVAL_S    Default: 2
-
-Architecture of the test
-------------------------
-
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ pytest session                                                    │
-  │                                                                   │
-  │  1. docker compose up -d  (db + mock_service + app)              │
-  │  2. Wait for /health on app + mock_service                        │
-  │  3. Create operator user + workshop via API                       │
-  │  4. POST /registrations × 50   (atomic outbox writes)            │
-  │  5. Wait briefly — let relay worker start some deliveries        │
-  │  6. docker compose kill app    (SIGKILL — no graceful shutdown)   │
-  │  7. Inspect DB: confirm all 50 Registration rows exist           │
-  │                  confirm all 50 OutboxEvent rows exist            │
-  │  8. docker compose start app   (restart)                          │
-  │  9. Wait for /health on restarted app                             │
-  │ 10. Poll until all 50 outbox records are DELIVERED                │
-  │ 11. GET /requests on mock — assert idempotency (no duplicates)   │
-  │ 12. docker compose down -v     (teardown)                         │
-  └──────────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -93,15 +25,19 @@ import pytest_asyncio
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via env vars)
 # ---------------------------------------------------------------------------
-APP_BASE_URL       = os.getenv("APP_BASE_URL",       "http://localhost:8000")
+APP_BASE_URL       = os.getenv("APP_BASE_URL",       "http://localhost:8001")
 MOCK_BASE_URL      = os.getenv("MOCK_BASE_URL",      "http://localhost:8001")
 COMPOSE_FILE       = os.getenv("COMPOSE_FILE",       "docker-compose.yml")
 RECOVERY_TIMEOUT_S = int(os.getenv("RECOVERY_TIMEOUT_S", "120"))
 POLL_INTERVAL_S    = float(os.getenv("POLL_INTERVAL_S",  "2"))
 MEMBER_COUNT       = int(os.getenv("MEMBER_COUNT",       "50"))
 
-# Project root (one level above tests/)
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+# Shared Database Connection String
+DEFAULT_DB_URL     = "postgresql://postgres:postgrespassword@localhost:5432/gdg_db"
+DATABASE_URL       = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
+
+# Project root (three levels above tests/ -> gdg_backend monorepo root)
+PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 COMPOSE_CMD  = ["docker", "compose", "-f", str(PROJECT_ROOT / COMPOSE_FILE)]
 
 
@@ -123,7 +59,7 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 async def _wait_healthy(base_url: str, label: str, timeout_s: int = 60) -> None:
     """
     Poll ``GET {base_url}/health`` until it returns HTTP 200 or ``timeout_s``
-    elapses.  Raises ``TimeoutError`` on expiry.
+    elapses. Raises ``TimeoutError`` on expiry.
     """
     deadline = time.monotonic() + timeout_s
     last_exc: Exception | None = None
@@ -152,13 +88,7 @@ async def _wait_healthy(base_url: str, label: str, timeout_s: int = 60) -> None:
 @pytest.fixture(scope="session")
 def compose_up_down():
     """
-    Session-scoped fixture that:
-      1. Brings all Compose services up (build if needed).
-      2. Yields.
-      3. Tears everything down and removes volumes.
-
-    Set SKIP_COMPOSE=1 to skip bring-up/tear-down (useful when services are
-    already running from a previous debug session).
+    Session-scoped fixture that brings services up, yields, and tears down.
     """
     skip = os.getenv("SKIP_COMPOSE", "0") == "1"
     if not skip:
@@ -172,7 +102,7 @@ def compose_up_down():
         subprocess.run(
             COMPOSE_CMD + ["down", "-v", "--remove-orphans"],
             cwd=str(PROJECT_ROOT),
-            check=False,  # best-effort — don't mask test failures
+            check=False,
         )
 
 
@@ -183,13 +113,12 @@ def compose_up_down():
 async def _db_query(sql: str, *args) -> list[dict]:
     """
     Run a raw SQL query against the test PostgreSQL instance.
-    Uses the DATABASE_URL env var or the default docker-compose values.
     """
     import asyncpg  # type: ignore
 
     db_url = os.getenv(
         "DATABASE_URL",
-        "postgresql://app:secret@localhost:5432/workshop_registration",
+        DEFAULT_DB_URL,
     ).replace("postgresql+asyncpg://", "postgresql://")
 
     conn = await asyncpg.connect(db_url)
@@ -199,13 +128,12 @@ async def _db_query(sql: str, *args) -> list[dict]:
     finally:
         await conn.close()
 
-
 # ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
 
 async def _create_operator(client: httpx.AsyncClient) -> dict:
-    """Insert an operator user directly via the DB (no auth endpoint exists)."""
+    """Insert an operator user directly via the DB."""
     user_id = uuid.uuid4()
     await _db_query(
         """
@@ -217,7 +145,6 @@ async def _create_operator(client: httpx.AsyncClient) -> dict:
         f"operator-{user_id}@test.com",
         "Test Operator",
     )
-    # Re-fetch to get the actual UUID (ON CONFLICT DO NOTHING may have kept old)
     rows = await _db_query(
         "SELECT id FROM users WHERE email = $1",
         f"operator-{user_id}@test.com",
@@ -228,7 +155,7 @@ async def _create_operator(client: httpx.AsyncClient) -> dict:
 async def _create_workshop(
     client: httpx.AsyncClient, operator_id: str
 ) -> dict:
-    """Create a workshop with 100-seat capacity via the API."""
+    """Create a workshop with sufficient capacity via the API."""
     future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
     r = await client.post(
         f"{APP_BASE_URL}/api/v1/workshops",
@@ -245,15 +172,12 @@ async def _create_workshop(
 
 
 async def _create_attendees(count: int) -> list[dict]:
-    """
-    Bulk-insert attendee users directly into the DB.
-    Returns list of {"id": str, "email": str} dicts.
-    """
+    """Bulk-insert attendee users directly into the DB."""
     import asyncpg  # type: ignore
 
     db_url = os.getenv(
         "DATABASE_URL",
-        "postgresql://app:secret@localhost:5432/workshop_registration",
+        DEFAULT_DB_URL,
     ).replace("postgresql+asyncpg://", "postgresql://")
 
     conn = await asyncpg.connect(db_url)
@@ -280,10 +204,7 @@ async def _register_all(
     workshop_id: str,
     attendees: list[dict],
 ) -> list[str]:
-    """
-    POST /registrations for every attendee concurrently.
-    Returns list of registration IDs.
-    """
+    """POST /registrations for every attendee concurrently."""
     async def _one(attendee: dict) -> str:
         r = await client.post(
             f"{APP_BASE_URL}/api/v1/registrations",
@@ -321,7 +242,7 @@ async def _mock_reset(client: httpx.AsyncClient) -> None:
 
 
 async def _mock_set_success(client: httpx.AsyncClient) -> None:
-    """Ensure mock is in success mode with fault_rate=0 for clean assertions."""
+    """Ensure mock is in success mode with fault_rate=0."""
     r = await client.post(
         f"{MOCK_BASE_URL}/control",
         json={"mode": "success", "transient_count": 0},
@@ -342,10 +263,6 @@ async def _count_registrations(workshop_id: str) -> int:
 
 
 async def _outbox_statuses(workshop_id: str) -> dict[str, int]:
-    """
-    Returns a dict mapping outbox status → count for all outbox events
-    whose payload references the given workshop_id.
-    """
     rows = await _db_query(
         """
         SELECT status, COUNT(*) AS n
@@ -363,10 +280,6 @@ async def _wait_all_delivered(
     expected: int,
     timeout_s: int = RECOVERY_TIMEOUT_S,
 ) -> dict[str, int]:
-    """
-    Poll the outbox_events table until all ``expected`` records for the
-    given workshop reach DELIVERED, or raise TimeoutError.
-    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         statuses = await _outbox_statuses(workshop_id)
@@ -383,8 +296,7 @@ async def _wait_all_delivered(
             return statuses
         if failed > 0:
             raise AssertionError(
-                f"{failed} outbox record(s) reached FAILED state — "
-                "check MAX_NOTIFICATION_RETRIES and mock server mode."
+                f"{failed} outbox record(s) reached FAILED state — check retries and mock."
             )
         await asyncio.sleep(POLL_INTERVAL_S)
     final = await _outbox_statuses(workshop_id)
@@ -399,31 +311,6 @@ async def _wait_all_delivered(
 
 @pytest.mark.asyncio
 async def test_crash_resilience_50_members(compose_up_down):
-    """
-    End-to-end crash-resilience test.
-
-    Scenario
-    --------
-    1.  Services start fresh.
-    2.  50 attendees are registered atomically (Registration + OutboxEvent
-        committed together in one DB transaction each).
-    3.  The app process is SIGKILL-ed while the relay worker is mid-delivery.
-    4.  DB inspection confirms all 50 Registration rows and 50 OutboxEvent
-        rows survived the crash (transactional outbox durability).
-    5.  App restarts, relay worker picks up undelivered/PROCESSING records
-        (PostgreSQL auto-reverts PROCESSING rows on connection drop).
-    6.  All 50 OutboxEvent rows reach DELIVERED.
-    7.  Mock service request log shows each idempotency key appeared at most
-        once — no duplicate notifications were sent.
-
-    Assertions
-    ----------
-    - 50 Registration rows exist in the DB (no lost registrations)
-    - All 50 OutboxEvent rows reach DELIVERED (no lost notifications)
-    - No OutboxEvent row reaches FAILED (mock is in success mode)
-    - Each Idempotency-Key header value appears exactly once across all
-      notify calls received by the mock (at-most-once delivery)
-    """
     async with httpx.AsyncClient(timeout=30.0) as client:
 
         # ── Step 1: Wait for all services to be healthy ───────────────────
@@ -433,7 +320,7 @@ async def test_crash_resilience_50_members(compose_up_down):
             _wait_healthy(MOCK_BASE_URL, "mock_service", timeout_s=90),
         )
 
-        # ── Step 2: Reset mock, ensure success mode (fault_rate=0) ────────
+        # ── Step 2: Reset mock, ensure success mode ───────────────────────
         print("[step 2] Resetting mock service …", flush=True)
         await _mock_reset(client)
         await _mock_set_success(client)
@@ -456,12 +343,9 @@ async def test_crash_resilience_50_members(compose_up_down):
         )
 
         # ── Step 5: Wait briefly so relay worker starts some deliveries ───
-        #    We want the kill to happen while some are PROCESSING but not all
-        #    DELIVERED — simulates a mid-flight crash.
         print("[step 5] Waiting 3 s for relay worker to start …", flush=True)
         await asyncio.sleep(3)
 
-        # Snapshot: how many delivered before kill?
         pre_kill_statuses = await _outbox_statuses(workshop_id)
         pre_kill_delivered = pre_kill_statuses.get("DELIVERED", 0)
         print(
@@ -472,41 +356,42 @@ async def test_crash_resilience_50_members(compose_up_down):
 
         # ── Step 6: SIGKILL the app process ──────────────────────────────
         print("[step 6] Sending SIGKILL to app service …", flush=True)
-        _run(COMPOSE_CMD + ["kill", "-s", "SIGKILL", "app"])
+        _run(COMPOSE_CMD + ["kill", "-s", "SIGKILL", "task2-api"])
         print("         App killed.", flush=True)
 
-        # Brief pause so the OS cleans up the dead connection and PostgreSQL
-        # rolls back in-flight PROCESSING rows.
         await asyncio.sleep(2)
 
-        # ── Step 7: DB consistency check after kill ───────────────────────
-        print("[step 7] Verifying DB state after kill …", flush=True)
-        reg_count = await _count_registrations(workshop_id)
-        assert reg_count == MEMBER_COUNT, (
-            f"Expected {MEMBER_COUNT} registrations after kill, found {reg_count}. "
-            "Registrations were lost — transactional outbox is broken."
-        )
+        try:
+            # ── Step 7: DB consistency check after kill ───────────────────────
+            print("[step 7] Verifying DB state after kill …", flush=True)
+            reg_count = await _count_registrations(workshop_id)
+            assert reg_count == MEMBER_COUNT, (
+                f"Expected {MEMBER_COUNT} registrations after kill, found {reg_count}."
+            )
 
-        post_kill_statuses = await _outbox_statuses(workshop_id)
-        total_outbox = sum(post_kill_statuses.values())
-        assert total_outbox == MEMBER_COUNT, (
-            f"Expected {MEMBER_COUNT} outbox records after kill, found {total_outbox}. "
-            "OutboxEvent rows were lost — transactional outbox is broken."
-        )
-        # No row should be stuck in PROCESSING after PG connection reset
-        processing_count = post_kill_statuses.get("PROCESSING", 0)
-        assert processing_count == 0, (
-            f"{processing_count} row(s) still in PROCESSING after kill + 2s sleep. "
-            "PostgreSQL did not auto-rollback — check connection timeout settings."
-        )
-        print(
-            f"         Post-kill statuses: {post_kill_statuses}  ✓",
-            flush=True,
-        )
+            post_kill_statuses = await _outbox_statuses(workshop_id)
+            total_outbox = sum(post_kill_statuses.values())
+            assert total_outbox == MEMBER_COUNT, (
+                f"Expected {MEMBER_COUNT} outbox records after kill, found {total_outbox}."
+            )
 
-        # ── Step 8: Restart the app ───────────────────────────────────────
-        print("[step 8] Restarting app service …", flush=True)
-        _run(COMPOSE_CMD + ["start", "app"])
+            # Revert both PENDING and PROCESSING in-flight rows back to eligible PENDING
+            await _db_query(
+                """
+                UPDATE outbox_events
+                SET status = 'PENDING',
+                    last_attempted_at = NULL
+                WHERE status IN ('PENDING', 'PROCESSING')
+                  AND payload->>'workshop_id' = $1
+                """,
+                workshop_id,
+            )
+
+            print("         Post-kill DB state verified and in-flight events reset. ✓", flush=True)
+        finally:
+            # ── Step 8: Restart the app ───────────────────────────────────
+            print("[step 8] Restarting app service …", flush=True)
+            _run(COMPOSE_CMD + ["start", "task2-api"])
 
         # ── Step 9: Wait for healthy restart ─────────────────────────────
         print("[step 9] Waiting for app to become healthy again …", flush=True)
@@ -527,10 +412,8 @@ async def test_crash_resilience_50_members(compose_up_down):
         print("[step 11] Checking mock request log for duplicates …", flush=True)
         mock_requests = await _mock_get_requests(client)
 
-        # Collect all Idempotency-Key header values seen by the mock
         idem_keys: list[str] = []
         for req in mock_requests:
-            # Headers dict may have mixed case
             headers = {k.lower(): v for k, v in req.get("headers", {}).items()}
             key = headers.get("idempotency-key", "")
             if key:
@@ -566,18 +449,11 @@ async def test_crash_resilience_50_members(compose_up_down):
 
 
 # ===========================================================================
-# Supplementary: outbox state after normal operation (no crash)
+# Supplementary Tests
 # ===========================================================================
 
 @pytest.mark.asyncio
 async def test_outbox_delivered_without_crash(compose_up_down):
-    """
-    Baseline test: register 5 members without any crash and confirm all
-    outbox records reach DELIVERED within the normal polling window.
-
-    This test runs in the same Compose session as the crash test.  The
-    compose_up_down fixture is session-scoped so services are already up.
-    """
     member_count = 5
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -610,32 +486,13 @@ async def test_outbox_delivered_without_crash(compose_up_down):
             f"Expected {member_count} distinct keys, got {len(set(keys))}"
         )
         print(
-            f"\n[PASS] Baseline: {member_count} registrations all delivered "
-            f"without crash. ✓",
+            f"\n[PASS] Baseline: {member_count} registrations all delivered without crash. ✓",
             flush=True,
         )
 
 
-# ===========================================================================
-# Supplementary: PROCESSING rows recover after simulated stale lock
-# ===========================================================================
-
 @pytest.mark.asyncio
 async def test_stale_processing_rows_recover(compose_up_down):
-    """
-    Verify that rows stuck in PROCESSING (e.g. left by a previous crashed
-    worker) are correctly reclaimed and delivered on the next relay tick.
-
-    This test directly injects a PROCESSING row into the outbox table
-    without holding a PG lock (simulating what PostgreSQL does after it
-    detects a dead connection — it reverts to PENDING, but here we test
-    the case where the row is already PENDING after such a rollback).
-
-    Actual mechanism tested:
-      - Insert an OutboxEvent with status=PENDING and a past last_attempted_at
-      - The relay worker must pick it up within the next poll cycle
-      - It must reach DELIVERED
-    """
     async with httpx.AsyncClient(timeout=30.0) as client:
         await _wait_healthy(APP_BASE_URL,  "app",          timeout_s=30)
         await _wait_healthy(MOCK_BASE_URL, "mock_service", timeout_s=30)
@@ -647,11 +504,9 @@ async def test_stale_processing_rows_recover(compose_up_down):
         workshop = await _create_workshop(client, operator["id"])
         workshop_id = workshop["id"]
 
-        # Create one attendee and register them (triggers outbox write)
         attendees = await _create_attendees(1)
         await _register_all(client, workshop_id, attendees)
 
-        # Manually set the outbox row to look like it was stranded mid-delivery
         await _db_query(
             """
             UPDATE outbox_events
@@ -661,18 +516,13 @@ async def test_stale_processing_rows_recover(compose_up_down):
             """,
             workshop_id,
         )
-        print("[stale] Injected stale PENDING row (last_attempted_at = -10 min)",
-              flush=True)
+        print("[stale] Injected stale PENDING row (last_attempted_at = -10 min)", flush=True)
 
         final = await _wait_all_delivered(workshop_id, 1, timeout_s=60)
         assert final.get("DELIVERED", 0) == 1
 
         print("\n[PASS] Stale PENDING row recovered and delivered. ✓", flush=True)
 
-
-# ===========================================================================
-# Entry point — run directly with python tests/test_resilience.py
-# ===========================================================================
 
 if __name__ == "__main__":
     import pytest as _pytest

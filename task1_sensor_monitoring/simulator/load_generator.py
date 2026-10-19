@@ -160,7 +160,7 @@ class Stats:
             f"  Throughput      : {self.rps:.0f} req/s\n"
             f"  Latency avg     : {self.avg_latency_ms:.1f} ms\n"
             f"  Latency min     : {min_ms:.1f} ms\n"
-            f"  Latency max     : {self.max_latency_ms * 1000:.1f} ms\n"
+            f"  Latency max     : {self.max_latency_s * 1000:.1f} ms\n"
             "───────────────────────────────────────────────────"
         )
 

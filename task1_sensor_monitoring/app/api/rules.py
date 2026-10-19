@@ -163,6 +163,8 @@ async def update_alert_rule(
     return rule
 
 
+from fastapi import APIRouter, Response, status
+
 @router.delete(
     "/{rule_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -175,10 +177,11 @@ async def update_alert_rule(
 async def delete_alert_rule(
     rule_id: uuid.UUID,
     db: DbDep,
-) -> None:
+) -> Response:
     """Delete a rule. Existing open alerts retain their ``rule_id`` as NULL
     (ON DELETE SET NULL) so audit history is preserved."""
     rule = await _get_rule_or_404(db, rule_id)
     await db.delete(rule)
     await db.commit()
     log.info("deleted alert rule id=%s", rule_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

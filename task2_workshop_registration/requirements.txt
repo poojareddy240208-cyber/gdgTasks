@@ -4,7 +4,7 @@ uvicorn[standard]==0.29.0
 python-multipart==0.0.9       # form/body parsing used by FastAPI
 
 # ── Database (async) ─────────────────────────────────────────────────────────
-sqlalchemy==2.0.30
+sqlalchemy[asyncio]==2.0.36
 asyncpg==0.29.0               # async PostgreSQL driver for SQLAlchemy
 alembic==1.13.1               # schema migrations
 
@@ -12,8 +12,8 @@ alembic==1.13.1               # schema migrations
 redis==5.2.1                  # redis-py with built-in asyncio support (aioredis merged)
 
 # ── Validation & configuration ────────────────────────────────────────────────
-pydantic==2.7.1
-pydantic-settings==2.2.1      # Settings from env vars / .env files
+pydantic==2.9.2
+pydantic-settings==2.5.2      # Settings from env vars / .env files
 
 # ── HTTP client (relay worker → notification service) ────────────────────────
 httpx==0.27.0
@@ -29,3 +29,8 @@ structlog==24.1.0
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
 prometheus-client==0.20.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==8.3.3
+pytest-asyncio==0.24.0        # async test support (asyncio mode=auto)
+anyio==4.6.2                  # async test backend used by pytest-asyncio

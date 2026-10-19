@@ -1,0 +1,53 @@
+
+services:
+  # --- Shared Infrastructure ---
+  postgres:
+    image: postgres:15-alpine
+    container_name: gdg_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: gdg_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: gdg_redis
+    ports:
+      - "6379:6379"
+
+  # --- Task 1 Application ---
+  task1-api:
+    build:
+      context: ./task1_sensor_monitoring
+      dockerfile: Dockerfile
+    container_name: task1_sensor_api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@postgres:5432/gdg_db
+      - REDIS_URL=redis://redis:6379/0
+
+  # --- Task 2 Applications ---
+  task2-api:
+    build:
+      context: ./task2_workshop_registration
+      dockerfile: Dockerfile
+    container_name: task2_workshop_api
+    ports:
+      - "8001:8001"
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@postgres:5432/gdg_db
+      - REDIS_URL=redis://redis:6379/1
+
+volumes:
+  pgdata:
