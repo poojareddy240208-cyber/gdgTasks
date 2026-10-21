@@ -32,9 +32,8 @@ RECOVERY_TIMEOUT_S = int(os.getenv("RECOVERY_TIMEOUT_S", "120"))
 POLL_INTERVAL_S    = float(os.getenv("POLL_INTERVAL_S",  "2"))
 MEMBER_COUNT       = int(os.getenv("MEMBER_COUNT",       "50"))
 
-# Shared Database Connection String
+# Shared Database Connection String for Host-Side DB Connection
 DEFAULT_DB_URL     = "postgresql://postgres:postgrespassword@localhost:5432/gdg_db"
-DATABASE_URL       = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 
 # Project root (three levels above tests/ -> gdg_backend monorepo root)
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
@@ -110,17 +109,24 @@ def compose_up_down():
 # DB helper — direct asyncpg connection (bypasses the app process)
 # ---------------------------------------------------------------------------
 
+def _get_host_db_url() -> str:
+    """
+    Construct the database connection string specifically for host-side
+    asyncpg connections, ignoring app-container specific passwords.
+    """
+    env_url = os.getenv("DATABASE_URL", "")
+    if env_url and not "app:" in env_url:
+        return env_url.replace("postgresql+asyncpg://", "postgresql://")
+    return DEFAULT_DB_URL
+
+
 async def _db_query(sql: str, *args) -> list[dict]:
     """
     Run a raw SQL query against the test PostgreSQL instance.
     """
     import asyncpg  # type: ignore
 
-    db_url = os.getenv(
-        "DATABASE_URL",
-        DEFAULT_DB_URL,
-    ).replace("postgresql+asyncpg://", "postgresql://")
-
+    db_url = _get_host_db_url()
     conn = await asyncpg.connect(db_url)
     try:
         rows = await conn.fetch(sql, *args)
@@ -175,11 +181,7 @@ async def _create_attendees(count: int) -> list[dict]:
     """Bulk-insert attendee users directly into the DB."""
     import asyncpg  # type: ignore
 
-    db_url = os.getenv(
-        "DATABASE_URL",
-        DEFAULT_DB_URL,
-    ).replace("postgresql+asyncpg://", "postgresql://")
-
+    db_url = _get_host_db_url()
     conn = await asyncpg.connect(db_url)
     try:
         users: list[dict] = []
@@ -375,7 +377,7 @@ async def test_crash_resilience_50_members(compose_up_down):
                 f"Expected {MEMBER_COUNT} outbox records after kill, found {total_outbox}."
             )
 
-            # Revert both PENDING and PROCESSING in-flight rows back to eligible PENDING
+            # Revert both PENDING and PROCESSING events back to eligible PENDING state
             await _db_query(
                 """
                 UPDATE outbox_events

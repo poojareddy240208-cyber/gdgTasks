@@ -65,16 +65,19 @@ class MockState:
     fault_rate: float = dataclasses.field(
         default_factory=lambda: float(os.getenv("MOCK_FAULT_RATE", "0.30"))
     )
+    # In-memory idempotency cache {idempotency_key: response_dict}
+    idempotency_cache: dict[str, dict] = dataclasses.field(default_factory=dict)
     _lock: threading.Lock = dataclasses.field(
         default_factory=threading.Lock, repr=False
     )
 
     def reset(self) -> None:
-        """Clear the request log and return to SUCCESS mode."""
+        """Clear the request log, idempotency cache, and return to SUCCESS mode."""
         with self._lock:
             self.mode = FaultMode.SUCCESS
             self.transient_count = 0
             self.request_log.clear()
+            self.idempotency_cache.clear()
 
 
 # Module-level singleton – import this in main.py

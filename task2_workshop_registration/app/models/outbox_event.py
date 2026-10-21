@@ -51,7 +51,7 @@ cases after bulk cancellation deletes or modifies related rows).
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Index, Integer, JSON, String
 from sqlalchemy.orm import Mapped, mapped_column
@@ -63,14 +63,18 @@ class OutboxEventType(str, enum.Enum):
     """
     Domain event that triggered this outbox record.
 
-    REGISTRATION_CONFIRMED  — a new seat was claimed.
-    REGISTRATION_CANCELLED  — an attendee cancelled their own seat.
-    WORKSHOP_CANCELLED      — an operator cancelled the whole workshop.
+    REGISTRATION_CONFIRMED    — a new seat was claimed.
+    REGISTRATION_CANCELLED    — an attendee cancelled their own seat.
+    WORKSHOP_CANCELLED        — an operator cancelled the whole workshop.
+    WORKSHOP_CANCEL_REQUESTED — Phase 1 async fan-out trigger for workshop cancellation.
+    NOTIFICATION_SEND         — individual attendee notification dispatch task.
     """
 
     REGISTRATION_CONFIRMED = "REGISTRATION_CONFIRMED"
     REGISTRATION_CANCELLED = "REGISTRATION_CANCELLED"
     WORKSHOP_CANCELLED = "WORKSHOP_CANCELLED"
+    WORKSHOP_CANCEL_REQUESTED = "WORKSHOP_CANCEL_REQUESTED"
+    NOTIFICATION_SEND = "NOTIFICATION_SEND"
 
 
 class OutboxEventStatus(str, enum.Enum):
@@ -123,6 +127,8 @@ class OutboxEvent(Base, TimestampMixin):
     __table_args__ = (
         # Relay worker poll query: status='PENDING' ORDER BY created_at
         Index("ix_outbox_status_created", "status", "created_at"),
+        # Composite index for HoL-free eligible polling
+        Index("ix_outbox_eligible", "status", "next_attempt_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -161,6 +167,13 @@ class OutboxEvent(Base, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
         comment="Timestamp of the most recent delivery attempt; drives back-off logic.",
+    )
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+        comment="When this event becomes eligible for delivery attempt.",
     )
     # Stable across all retries — this is the value forwarded as the
     # Idempotency-Key header so the notification service can deduplicate.

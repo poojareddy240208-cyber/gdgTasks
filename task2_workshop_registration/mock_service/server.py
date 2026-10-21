@@ -149,6 +149,17 @@ async def receive_notification(request: Request) -> dict:
     ───────────────
     See module docstring.  Random faults fire here only.
     """
+    # ── Check Idempotency Cache ─────────────────────────────────────────────
+    if idempotency_key:
+        with state._lock:
+            if idempotency_key in state.idempotency_cache:
+                logger.info(
+                    "notify.idempotent_replay",
+                    idempotency_key=idempotency_key,
+                    event_type=event_type,
+                )
+                return state.idempotency_cache[idempotency_key]
+
     # --- Read and log the request before applying any fault -----------------
     try:
         body = await request.json()
@@ -249,11 +260,16 @@ async def receive_notification(request: Request) -> dict:
         idempotency_key=idempotency_key,
         event_type=event_type,
     )
-    return {
+    success_response = {
         "status":          "accepted",
         "idempotency_key": idempotency_key,
         "event_type":      event_type,
     }
+    if idempotency_key:
+        with state._lock:
+            state.idempotency_cache[idempotency_key] = success_response
+
+    return success_response
 
 
 # ---------------------------------------------------------------------------

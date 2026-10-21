@@ -325,46 +325,108 @@ async def metrics():
 # ---------------------------------------------------------------------------
 # Test & Resilience Mock Helpers
 # ---------------------------------------------------------------------------
-_sent_notifications = []
-_mock_behavior = {"always_fail": False, "delay_s": 0}
+import json
+import tempfile
+from pathlib import Path
+
+_MOCK_STATE_PATH = Path(os.getenv("MOCK_STATE_PATH", str(Path(tempfile.gettempdir()) / "gdg_mock_state.json")))
+
+_sent_notifications: list[dict] = []
+_idempotency_cache: dict[str, dict] = {}
+_mock_behavior: dict = {"always_fail": False, "delay_s": 0, "transient_count": 0}
+
+def _load_mock_persisted():
+    global _sent_notifications, _idempotency_cache, _mock_behavior
+    try:
+        if _MOCK_STATE_PATH.exists():
+            data = json.loads(_MOCK_STATE_PATH.read_text(encoding="utf-8"))
+            _sent_notifications = data.get("sent_notifications", [])
+            _idempotency_cache = data.get("idempotency_cache", {})
+            _mock_behavior = data.get("behavior", {"always_fail": False, "delay_s": 0, "transient_count": 0})
+    except Exception as exc:
+        logger.warning("mock_load_persisted_failed", exc=str(exc))
+
+def _persist_mock_state():
+    try:
+        _MOCK_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = _MOCK_STATE_PATH.with_suffix(".tmp")
+        temp_path.write_text(
+            json.dumps({
+                "sent_notifications": _sent_notifications,
+                "idempotency_cache": _idempotency_cache,
+                "behavior": _mock_behavior,
+            }),
+            encoding="utf-8"
+        )
+        temp_path.replace(_MOCK_STATE_PATH)
+    except Exception as exc:
+        logger.warning("mock_persist_failed", exc=str(exc))
+
+_load_mock_persisted()
 
 @app.post("/reset")
 async def reset_mock_notifications():
-    global _sent_notifications, _mock_behavior
+    global _sent_notifications, _mock_behavior, _idempotency_cache
     _sent_notifications.clear()
-    _mock_behavior = {"always_fail": False, "delay_s": 0}
+    _idempotency_cache.clear()
+    _mock_behavior = {"always_fail": False, "delay_s": 0, "transient_count": 0}
+    _persist_mock_state()
     return {"status": "reset", "delivered_count": 0}
 
 @app.post("/control")
 async def control_mock_behavior(payload: dict):
     global _mock_behavior
+    _load_mock_persisted()
     if "always_fail" in payload:
         _mock_behavior["always_fail"] = payload["always_fail"]
     if "delay_s" in payload:
         _mock_behavior["delay_s"] = payload["delay_s"]
+    if "mode" in payload:
+        _mock_behavior["mode"] = payload["mode"]
+        if payload["mode"] == "server_error":
+            _mock_behavior["always_fail"] = True
+        elif payload["mode"] == "success":
+            _mock_behavior["always_fail"] = False
+    if "transient_count" in payload:
+        _mock_behavior["transient_count"] = payload["transient_count"]
+    _persist_mock_state()
     return {"status": "updated", "behavior": _mock_behavior}
 
 @app.get("/requests")
 @app.get("/notifications")
 @app.get("/api/v1/notifications")
 async def get_mock_notifications():
-    # Structured response supporting both request list assertions and header inspections
+    _load_mock_persisted()
     formatted_requests = [
         {"headers": item.get("headers", {}), "payload": item.get("payload", item)} 
         if isinstance(item, dict) and "payload" in item else {"headers": {}, "payload": item}
         for item in _sent_notifications
     ]
-    return {"requests": formatted_requests, "notifications": _sent_notifications}
+    return {"count": len(formatted_requests), "requests": formatted_requests, "notifications": _sent_notifications}
 
 @app.post("/notify")
 @app.post("/api/v1/notify")
 async def mock_notify_sink(request: Request, payload: dict):
+    _load_mock_persisted()
+    idempotency_key = request.headers.get("idempotency-key")
+    if idempotency_key and idempotency_key in _idempotency_cache:
+        return _idempotency_cache[idempotency_key]
+
     if _mock_behavior.get("delay_s", 0) > 0:
         await asyncio.sleep(_mock_behavior["delay_s"])
+
+    if _mock_behavior.get("transient_count", 0) > 0:
+        _mock_behavior["transient_count"] -= 1
+        _persist_mock_state()
+        raise HTTPException(status_code=500, detail="Simulated transient mock failure")
         
     if _mock_behavior.get("always_fail", False):
         raise HTTPException(status_code=500, detail="Simulated mock notification service failure")
         
     headers = dict(request.headers)
     _sent_notifications.append({"headers": headers, "payload": payload})
-    return {"status": "delivered"}
+    resp = {"status": "delivered", "idempotency_key": idempotency_key}
+    if idempotency_key:
+        _idempotency_cache[idempotency_key] = resp
+    _persist_mock_state()
+    return resp

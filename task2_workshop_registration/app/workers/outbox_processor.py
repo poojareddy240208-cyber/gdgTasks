@@ -15,12 +15,13 @@ from typing import TYPE_CHECKING
 
 import httpx
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import AsyncSessionLocal
-from app.models import OutboxEvent, OutboxEventStatus
+from app.models import OutboxEvent, OutboxEventStatus, OutboxEventType
+from app.services.cancellation import process_workshop_cancel_fanout
 
 if TYPE_CHECKING:
     pass
@@ -62,8 +63,19 @@ def backoff_with_jitter(attempts: int) -> float:
 
 async def _deliver(event_id: uuid.UUID, snapshot: dict) -> None:
     """
-    Attempt HTTP delivery of a single outbox event and update its status.
+    Attempt delivery of a single outbox event and update its status.
+    Handles WORKSHOP_CANCEL_REQUESTED fan-out internally, and HTTP notification
+    delivery for attendee notifications.
     """
+    # ── Phase 2 Async Fan-out: Workshop Cancellation ────────────────────────
+    if snapshot["event_type"] == OutboxEventType.WORKSHOP_CANCEL_REQUESTED.value:
+        try:
+            logger.info("outbox.processing_fanout", outbox_id=str(event_id))
+            await process_workshop_cancel_fanout(event_id, snapshot["payload"])
+        except Exception as exc:
+            logger.error("outbox.fanout_failed", outbox_id=str(event_id), error=str(exc))
+        return
+
     url = settings.notification_service_url.rstrip("/") + "/api/v1/notify"
     success = False
     exception_name: str | None = None
@@ -120,9 +132,11 @@ async def _deliver(event_id: uuid.UUID, snapshot: dict) -> None:
 
             if success:
                 ev.status = OutboxEventStatus.DELIVERED
+                ev.last_attempted_at = datetime.now(timezone.utc)
 
             elif ev.attempts >= settings.max_notification_retries:
                 ev.status = OutboxEventStatus.FAILED
+                ev.last_attempted_at = datetime.now(timezone.utc)
                 log.error(
                     "outbox.failed",
                     attempts=ev.attempts,
@@ -133,8 +147,11 @@ async def _deliver(event_id: uuid.UUID, snapshot: dict) -> None:
 
             else:
                 jitter_s = backoff_with_jitter(ev.attempts)
+                now = datetime.now(timezone.utc)
                 ev.status = OutboxEventStatus.PENDING
-                ev.last_attempted_at = datetime.now(timezone.utc)
+                ev.last_attempted_at = now
+                # Persist next_attempt_at with jitter to prevent thundering herd & HoL blocking
+                ev.next_attempt_at = now + timedelta(seconds=jitter_s)
                 log.info(
                     "outbox.scheduled_retry",
                     attempts=ev.attempts,
@@ -147,65 +164,48 @@ async def _deliver(event_id: uuid.UUID, snapshot: dict) -> None:
 # Claim helpers
 # ---------------------------------------------------------------------------
 
-def _next_attempt_eligible(ev: OutboxEvent, now: datetime) -> bool:
-    """
-    Check if an event's backoff period has passed.
-    """
-    if ev.last_attempted_at is None:
-        return True
-
-    required_delay_s = _base_delay(ev.attempts - 1)
-
-    last_attempt = ev.last_attempted_at
-    if last_attempt.tzinfo is None:
-        last_attempt = last_attempt.replace(tzinfo=timezone.utc)
-
-    return now >= (last_attempt + timedelta(seconds=required_delay_s))
-
-
 async def _claim_batch(session: AsyncSession) -> list[OutboxEvent]:
     """
     Claim up to relay_batch_size PENDING outbox events (or stranded PROCESSING events)
     eligible for delivery, and mark them PROCESSING in the same transaction.
     Uses FOR UPDATE SKIP LOCKED.
+
+    Eligibility:
+    - PENDING records where next_attempt_at <= now
+    - PROCESSING records stranded beyond (2 * timeout + 15s)
+    Ordered by next_attempt_at ASC to completely prevent Head-of-Line blocking.
     """
     now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(seconds=(settings.notification_timeout_s * 2 + 15))
 
-    # Reclaim events stuck in PROCESSING (e.g. stranded mid-flight post-SIGKILL)
-    stale_processing_threshold = now - timedelta(seconds=2)
-
-    result = await session.execute(
+    query = (
         select(OutboxEvent)
         .where(
             or_(
-                OutboxEvent.status == OutboxEventStatus.PENDING,
-                OutboxEvent.status == OutboxEventStatus.PROCESSING,
+                and_(
+                    OutboxEvent.status == OutboxEventStatus.PENDING,
+                    OutboxEvent.next_attempt_at <= now,
+                ),
+                and_(
+                    OutboxEvent.status == OutboxEventStatus.PROCESSING,
+                    OutboxEvent.last_attempted_at <= stale_cutoff,
+                ),
             )
         )
-        .order_by(OutboxEvent.created_at)
-        .limit(settings.relay_batch_size * 2)
+        .order_by(OutboxEvent.next_attempt_at.asc())
+        .limit(settings.relay_batch_size)
         .with_for_update(skip_locked=True)
     )
-    candidates = list(result.scalars().all())
 
-    eligible_events: list[OutboxEvent] = []
-    for ev in candidates:
-        if len(eligible_events) >= settings.relay_batch_size:
-            break
+    result = await session.execute(query)
+    eligible_events = list(result.scalars().all())
 
-        is_stale_processing = (
-            ev.status == OutboxEventStatus.PROCESSING and
-            (ev.last_attempted_at is None or ev.last_attempted_at <= stale_processing_threshold)
-        )
+    for ev in eligible_events:
+        if ev.status == OutboxEventStatus.PENDING:
+            ev.attempts += 1
 
-        if is_stale_processing or _next_attempt_eligible(ev, now):
-            # Only increment attempts if it was previously in PENDING state
-            if ev.status == OutboxEventStatus.PENDING:
-                ev.attempts += 1
-
-            ev.status = OutboxEventStatus.PROCESSING
-            ev.last_attempted_at = now
-            eligible_events.append(ev)
+        ev.status = OutboxEventStatus.PROCESSING
+        ev.last_attempted_at = now
 
     return eligible_events
 

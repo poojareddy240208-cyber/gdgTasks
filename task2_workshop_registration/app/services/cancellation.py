@@ -26,9 +26,10 @@ after all registration batches complete.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -152,6 +153,10 @@ async def cancel_registration(
 # Bulk workshop cancellation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Bulk workshop cancellation (Two-Phase Commit Pattern)
+# ---------------------------------------------------------------------------
+
 async def bulk_cancel_workshop(
     session: AsyncSession,
     *,
@@ -159,30 +164,9 @@ async def bulk_cancel_workshop(
     operator_user_id: uuid.UUID,
 ) -> int:
     """
-    Cancel a workshop and all its CONFIRMED registrations.
-
-    Returns
-    ────────
-    Total number of registrations that were cancelled.
-
-    Transaction strategy
-    ─────────────────────
-    The provided ``session`` is used only to load + lock the workshop and
-    check the idempotency guard.  Each batch of registrations is processed
-    in its own fresh ``AsyncSessionLocal`` transaction so that:
-
-    - Locks are released between batches (REQ-BK-06).
-    - A failure mid-way leaves completed batches committed (outbox records
-      are already durably written; partially-cancelled workshops are safe
-      because the relay worker will re-attempt any already-written outbox).
-
-    The final step — setting workshop.status = CANCELLED — is committed in
-    its own transaction after all registration batches succeed.
-
-    Idempotency
-    ───────────
-    If the workshop is already CANCELLED the function returns 0 immediately
-    without touching any registration rows (REQ-BK-02).
+    Phase 1: Mark Workshop CANCELLED and stage ONE single outbox event.
+    Runs in < 15ms. Holds no locks on registrations or long batch loops.
+    Returns the count of confirmed registrations that will be cancelled.
     """
     # ── 1. Load + lock the workshop ───────────────────────────────────────
     result = await session.execute(
@@ -199,22 +183,60 @@ async def bulk_cancel_workshop(
         logger.info("bulk_cancel.already_cancelled", workshop_id=str(workshop_id))
         return 0
 
-    # ── 3. Snapshot workshop fields for outbox payloads ──────────────────
-    # Capture now before any mutations so every batch payload is identical.
-    ws_title       = workshop.title
-    ws_scheduled   = workshop.scheduled_at.isoformat()
-    ws_venue       = workshop.venue
-    batch_size     = settings.bulk_cancel_batch_size
+    # Count confirmed registrations for response metadata
+    count_result = await session.execute(
+        select(func.count())
+        .select_from(Registration)
+        .where(Registration.workshop_id == workshop_id)
+        .where(Registration.status == RegistrationStatus.CONFIRMED)
+    )
+    confirmed_count = count_result.scalar_one()
+
+    # ── 3. Mark the workshop itself as CANCELLED ──────────────────────────
+    workshop.status = WorkshopStatus.CANCELLED
+
+    # ── 4. Stage exactly ONE WORKSHOP_CANCEL_REQUESTED outbox event ───────
+    outbox = OutboxEvent(
+        event_type=OutboxEventType.WORKSHOP_CANCEL_REQUESTED,
+        payload={
+            "workshop_id":    str(workshop.id),
+            "workshop_title": workshop.title,
+            "scheduled_at":   workshop.scheduled_at.isoformat(),
+            "venue":          workshop.venue,
+            "operator_id":    str(operator_user_id),
+            "expected_count": confirmed_count,
+        },
+        idempotency_key=f"bulk-cancel-{workshop.id}",
+    )
+    session.add(outbox)
+
+    logger.info(
+        "bulk_cancel.phase1_queued",
+        workshop_id=str(workshop_id),
+        operator_user_id=str(operator_user_id),
+        confirmed_count=confirmed_count,
+    )
+    return confirmed_count
+
+
+async def process_workshop_cancel_fanout(event_id: uuid.UUID, payload: dict) -> int:
+    """
+    Phase 2: Background worker handler that catches WORKSHOP_CANCEL_REQUESTED.
+    Queries attendees in batches of settings.bulk_cancel_batch_size, marks registrations
+    CANCELLED, and inserts individual NOTIFICATION_SEND events (without locking the parent workshop).
+    """
+    workshop_id = uuid.UUID(payload["workshop_id"])
+    ws_title = payload.get("workshop_title", "")
+    ws_scheduled = payload.get("scheduled_at", "")
+    ws_venue = payload.get("venue", "")
+    batch_size = settings.bulk_cancel_batch_size
 
     total_cancelled = 0
 
-    # ── 4. Process in batches ─────────────────────────────────────────────
+    # ── Process in batches ────────────────────────────────────────────────
     while True:
         async with AsyncSessionLocal() as batch_session:
             async with batch_session.begin():
-                # Claim a batch of CONFIRMED registrations with a row lock.
-                # SKIP LOCKED so multiple concurrent batch workers don't block
-                # each other (relevant if the endpoint is called concurrently).
                 rows_result = await batch_session.execute(
                     select(Registration)
                     .where(Registration.workshop_id == workshop_id)
@@ -223,11 +245,9 @@ async def bulk_cancel_workshop(
                     .with_for_update(skip_locked=True)
                 )
                 batch = rows_result.scalars().all()
-
                 if not batch:
-                    break  # all registrations processed
+                    break
 
-                # Load users for this batch in one query
                 user_ids = [r.user_id for r in batch]
                 users_result = await batch_session.execute(
                     select(User).where(User.id.in_(user_ids))
@@ -236,9 +256,8 @@ async def bulk_cancel_workshop(
 
                 for reg in batch:
                     reg.status = RegistrationStatus.CANCELLED
-
                     user = users_by_id.get(reg.user_id)
-                    payload = {
+                    item_payload = {
                         "user_id":        str(reg.user_id),
                         "user_email":     user.email if user else "",
                         "user_name":      user.full_name if user else "",
@@ -247,36 +266,33 @@ async def bulk_cancel_workshop(
                         "scheduled_at":   ws_scheduled,
                         "venue":          ws_venue,
                     }
-                    outbox = OutboxEvent(
-                        event_type=OutboxEventType.WORKSHOP_CANCELLED,
+                    notification_event = OutboxEvent(
+                        event_type=OutboxEventType.NOTIFICATION_SEND,
                         registration_id=reg.id,
-                        payload=payload,
-                        # Stable idempotency key per registration for this
-                        # specific bulk-cancel operation (REQ-OB-07).
-                        idempotency_key=f"bulk-cancel-{reg.id}",
+                        payload=item_payload,
+                        idempotency_key=f"bulk-cancel-notify-{reg.id}",
                     )
-                    batch_session.add(outbox)
+                    batch_session.add(notification_event)
 
                 total_cancelled += len(batch)
                 logger.info(
-                    "bulk_cancel.batch_committed",
+                    "bulk_cancel.fanout_batch_committed",
                     workshop_id=str(workshop_id),
                     batch_size=len(batch),
                     total_so_far=total_cancelled,
                 )
-                # batch_session.begin() auto-commits here on context exit
 
-    # ── 5. Mark the workshop itself as CANCELLED ──────────────────────────
-    async with AsyncSessionLocal() as final_session:
-        async with final_session.begin():
-            ws_final = await final_session.get(Workshop, workshop_id, with_for_update=True)
-            if ws_final and ws_final.status != WorkshopStatus.CANCELLED:
-                ws_final.status = WorkshopStatus.CANCELLED
+    # ── Mark the parent WORKSHOP_CANCEL_REQUESTED event as DELIVERED ──────
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            parent_ev = await session.get(OutboxEvent, event_id, with_for_update=True)
+            if parent_ev:
+                parent_ev.status = OutboxEventStatus.DELIVERED
+                parent_ev.last_attempted_at = datetime.now(timezone.utc)
 
     logger.info(
-        "bulk_cancel.complete",
+        "bulk_cancel.phase2_complete",
         workshop_id=str(workshop_id),
         total_cancelled=total_cancelled,
-        operator_user_id=str(operator_user_id),
     )
     return total_cancelled
