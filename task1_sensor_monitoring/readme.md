@@ -516,17 +516,29 @@ Starting load test → http://localhost:8000/api/v1/telemetry
   count=100000  rps=10000.0  concurrency=200  batch_size=1  timeout=10.0s                                                     
                                        
   sent=  14656  202=  14656  4xx=0  5xx=0  err=0  rps=     611  avg_ms= 314.8
+  
   sent=  99791  202=  99791  4xx=0  5xx=0  err=0  rps=     671  avg_ms= 295.6
+  
 ── Load Test Summary ──────────────────────────────
+
   Total sent      : 100000
+
   202 Accepted    : 100000  (100.0%)
+  
   4xx errors      : 0
+  
   5xx errors      : 0
+  
   Network errors  : 0
+  
   Elapsed         : 149.04s
+  
   Throughput      : 671 req/s
+  
   Latency avg     : 295.4 ms
+  
   Latency min     : 105.3 ms
+  
   Latency max     : 1330.6 ms
 ───────────────────────────────────────────────────
 ---
