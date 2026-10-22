@@ -502,34 +502,33 @@ Make sure the required dependencies are installed and the relevant external serv
 The project includes an asynchronous load generator intended to simulate high-volume telemetry traffic.
 
 ```bash
-python simulator/load_generator.py --rate 10000 --duration 10
+python task1_sensor_monitoring/simulator/load_generator.py --rps 10000 --count 100000
 ```
 
-This command requests a target rate of 10,000 requests per second for 10 seconds, provided that the script supports these arguments.
+This command requests a target rate of 100000 requests per second for 10 seconds, provided that the script supports these arguments.
 
 If the generator runs outside Docker, install its dependencies locally, including `aiohttp` if used by the script. If it runs inside a container, ensure those dependencies are included in that container's image.
 
 ### Review Load-Test Results
+Example run result:
 
-Inspect:
-
-```text
-LOAD_TEST_REPORT.md
-```
-
-Evaluate the following metrics:
-
-| Metric | Meaning |
-|---|---|
-| Throughput | Number of requests processed per second |
-| Average latency | Mean time taken to respond to requests |
-| P95 latency | Latency below which 95% of requests complete |
-| P99 latency | Latency below which 99% of requests complete |
-| Error rate | Percentage of requests that fail |
-| Queue backlog | Events waiting for consumer processing |
-
-The target of 10,000 requests per second and sub-15-millisecond ingestion latency should be treated as performance objectives until confirmed by reproducible test results.
-
+Starting load test → http://localhost:8000/api/v1/telemetry                                                                   
+  count=100000  rps=10000.0  concurrency=200  batch_size=1  timeout=10.0s                                                     
+                                       
+  sent=  14656  202=  14656  4xx=0  5xx=0  err=0  rps=     611  avg_ms= 314.8
+  sent=  99791  202=  99791  4xx=0  5xx=0  err=0  rps=     671  avg_ms= 295.6
+── Load Test Summary ──────────────────────────────
+  Total sent      : 100000
+  202 Accepted    : 100000  (100.0%)
+  4xx errors      : 0
+  5xx errors      : 0
+  Network errors  : 0
+  Elapsed         : 149.04s
+  Throughput      : 671 req/s
+  Latency avg     : 295.4 ms
+  Latency min     : 105.3 ms
+  Latency max     : 1330.6 ms
+───────────────────────────────────────────────────
 ---
 
 ## 🔍 Monitoring and Troubleshooting
