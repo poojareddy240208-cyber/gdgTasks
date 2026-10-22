@@ -483,20 +483,6 @@ If filtering by alert status is implemented, use the query parameters documented
 
 ### Run Unit and Integration Tests
 
-From the task directory, execute:
-
-```bash
-python -m pytest tests/ -v
-```
-
-For a concise test summary:
-
-```bash
-python -m pytest tests/ -q
-```
-
-Make sure the required dependencies are installed and the relevant external services are running for integration tests.
-
 ### Run the Load Generator
 
 The project includes an asynchronous load generator intended to simulate high-volume telemetry traffic.
@@ -540,6 +526,7 @@ Starting load test → http://localhost:8000/api/v1/telemetry
   Latency min     : 105.3 ms
   
   Latency max     : 1330.6 ms
+  
 ───────────────────────────────────────────────────
 ---
 
