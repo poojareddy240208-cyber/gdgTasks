@@ -519,18 +519,10 @@ The response should indicate that the user is already registered for that worksh
 
 The database uniqueness constraint protects against duplicates even when concurrent requests arrive simultaneously. The application must handle the corresponding database exception correctly.
 
-### 3. Run Automated Tests
-
-Run the test suite from the task directory:
+### 3. Run Test
 
 ```bash
-python -m pytest tests/ -v
-```
-
-To execute the dedicated resilience script:
-
-```bash
-python tests/test_resilience.py
+python task2_workshop_registration/tests/test_resilience.py
 ```
 
 The script may require Docker access and running API, database, and mock notification services. Review its configuration before executing destructive container operations.
